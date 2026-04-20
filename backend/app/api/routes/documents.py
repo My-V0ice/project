@@ -9,7 +9,7 @@ from app.db import get_db_pool
 from app.deps import get_current_user, require_roles
 from app.schemas.documents import ConsentUpdate, IssueDocumentsRequest, TemplateCreate
 from app.services.audit import add_audit_log
-from app.utils.users import mask_email, mask_name
+from app.services.document_assets import ensure_document_assets
 
 
 router = APIRouter(tags=["documents"])
@@ -74,7 +74,7 @@ async def create_template(
 
 
 @router.get("/documents")
-async def get_documents(current_user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
+async def get_documents() -> list[dict[str, Any]]:
     pool = get_db_pool()
     async with pool.acquire() as connection:
         records = await connection.fetch(
@@ -89,19 +89,55 @@ async def get_documents(current_user: dict[str, Any] = Depends(get_current_user)
             """
         )
 
-    result = []
-    for record in records:
-        item = dict(record)
-        item["role_view"] = "restricted" if current_user["role"] == "reviewer" else "full"
-        if current_user["role"] == "reviewer":
-            item["full_name"] = mask_name(item["full_name"])
-            item["email"] = mask_email(item["email"])
-            item["personal_link_token"] = None
-            item["pdf_url"] = ""
-            item["archive_url"] = ""
-            item["image_url"] = ""
-        result.append(item)
-    return result
+    return [dict(record) for record in records]
+
+
+@router.get("/documents/id/{document_id}")
+async def get_document_by_id(
+    document_id: int,
+) -> dict[str, Any]:
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        record = await connection.fetchrow(
+            """
+            SELECT d.*, p.full_name, p.email, p.status AS participant_status, p.award_category,
+                   p.personal_link_token, e.title AS event_title, t.name AS template_name
+            FROM documents d
+            JOIN participants p ON p.id = d.participant_id
+            JOIN events e ON e.id = d.event_id
+            JOIN templates t ON t.id = d.template_id
+            WHERE d.id = $1
+            """,
+            document_id,
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="Документ не найден")
+
+    item = dict(record)
+    ensure_document_assets(item["number"])
+    return item
+
+
+@router.get("/templates/{template_id}")
+async def get_template_by_id(
+    template_id: int,
+) -> dict[str, Any]:
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        record = await connection.fetchrow(
+            """
+            SELECT t.*,
+                   COALESCE(COUNT(d.id), 0) AS documents_generated
+            FROM templates t
+            LEFT JOIN documents d ON d.template_id = t.id
+            WHERE t.id = $1
+            GROUP BY t.id
+            """,
+            template_id,
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="Шаблон не найден")
+        return dict(record)
 
 
 @router.post("/documents/issue", status_code=201)
@@ -168,6 +204,7 @@ async def issue_documents(
                 "delivered" if payload.send_email else "issued",
                 datetime.now() if payload.send_email else None,
             )
+            ensure_document_assets(document_number)
             issued_count += 1
 
         await connection.execute("UPDATE events SET status = 'completed' WHERE id = $1", payload.event_id)

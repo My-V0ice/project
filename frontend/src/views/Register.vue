@@ -3,8 +3,8 @@
     <el-card class="auth-card auth-card-wide">
       <div class="section-heading">
         <span class="eyebrow">Регистрация</span>
-        <h1>Подключение роли к системе</h1>
-        <p>Для демонстрации можно создать аккаунт любой роли из ТЗ и сразу проверить соответствующий сценарий.</p>
+        <h1>???????? ????????</h1>
+        <p>??? ??????????? ???? ?? ??????????. ???? ??????????? ????????????????????.</p>
       </div>
 
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top">
@@ -15,12 +15,6 @@
 
           <el-form-item label="Email" prop="email">
             <el-input v-model="form.email" placeholder="name@togu.example" />
-          </el-form-item>
-
-          <el-form-item label="Роль" prop="role">
-            <el-select v-model="form.role" placeholder="Выберите роль">
-              <el-option v-for="role in roles" :key="role.value" :label="role.label" :value="role.value" />
-            </el-select>
           </el-form-item>
 
           <el-form-item label="Бренд" prop="brand_name">
@@ -52,7 +46,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api/axios'
@@ -60,12 +54,10 @@ import api from '../api/axios'
 const router = useRouter()
 const formRef = ref(null)
 const loading = ref(false)
-const roles = ref([])
 
 const form = reactive({
   full_name: '',
   email: '',
-  role: 'division_admin',
   brand_name: 'ТОГУ',
   division_name: 'Цифровая кафедра',
   password: '',
@@ -90,27 +82,11 @@ const rules = {
     { required: true, message: 'Введите email', trigger: 'blur' },
     { type: 'email', message: 'Укажите корректный email', trigger: 'blur' },
   ],
-  role: [{ required: true, message: 'Выберите роль', trigger: 'change' }],
   password: [
     { required: true, message: 'Введите пароль', trigger: 'blur' },
     { min: 6, message: 'Минимум 6 символов', trigger: 'blur' },
   ],
   confirmPassword: [{ validator: validateConfirmPassword, trigger: 'blur' }],
-}
-
-const loadRoles = async () => {
-  try {
-    const { data } = await api.get('/reference/roles')
-    roles.value = data
-  } catch {
-    roles.value = [
-      { value: 'superadmin', label: 'Суперадминистратор' },
-      { value: 'division_admin', label: 'Администратор подразделения' },
-      { value: 'reviewer', label: 'Проверяющий' },
-      { value: 'recipient', label: 'Получатель' },
-      { value: 'auditor', label: 'Наблюдатель / аудитор' },
-    ]
-  }
 }
 
 const handleRegister = async () => {
@@ -122,7 +98,6 @@ const handleRegister = async () => {
     await api.post('/auth/register', {
       full_name: form.full_name,
       email: form.email,
-      role: form.role,
       brand_name: form.brand_name,
       division_name: form.division_name,
       password: form.password,
@@ -136,5 +111,4 @@ const handleRegister = async () => {
   }
 }
 
-onMounted(loadRoles)
 </script>

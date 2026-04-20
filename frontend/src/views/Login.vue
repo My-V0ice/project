@@ -32,6 +32,7 @@ import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
+import { clearAuthSession, setAccessToken } from '../utils/authToken'
 
 const router = useRouter()
 const formRef = ref(null)
@@ -70,7 +71,11 @@ const handleLogin = async () => {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
     )
 
-    localStorage.setItem('access_token', response.data.access_token)
+    const token = setAccessToken(response.data.access_token)
+    if (!token) {
+      clearAuthSession()
+      throw new Error('Missing access token')
+    }
     localStorage.setItem('user_email', form.email)
     window.dispatchEvent(new Event('auth-changed'))
     ElMessage.success('Вход выполнен')

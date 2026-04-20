@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.db import get_db_pool
 from app.deps import get_current_user, require_roles
-from app.schemas.events import EventCreate, ParticipantImport
+from app.domain.constants import AWARD_CATEGORIES, ROLE_LABELS
+from app.schemas.events import EventCreate, ParticipantAssignUsers
 from app.services.audit import add_audit_log
 from app.utils.users import mask_email, mask_name
 
@@ -70,6 +71,28 @@ async def create_event(
         return dict(record)
 
 
+@router.get("/users/registered")
+async def list_registered_users(
+    current_user: dict[str, Any] = Depends(require_roles("superadmin", "division_admin")),
+) -> list[dict[str, Any]]:
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        records = await connection.fetch(
+            """
+            SELECT id, email, full_name, role, brand_name, division_name
+            FROM users
+            ORDER BY full_name ASC, id ASC
+            """
+        )
+        return [
+            {
+                **dict(record),
+                "role_label": ROLE_LABELS.get(record["role"], record["role"]),
+            }
+            for record in records
+        ]
+
+
 @router.get("/events/{event_id}/participants")
 async def get_event_participants(
     event_id: int,
@@ -96,26 +119,59 @@ async def get_event_participants(
         if current_user["role"] == "reviewer":
             item["full_name"] = mask_name(item["full_name"])
             item["email"] = mask_email(item["email"])
-            item["achievement"] = "Скрыто по роли"
+            item["achievement"] = "Hidden by role"
             item["personal_link_token"] = None
         items.append(item)
     return items
 
 
-@router.post("/events/{event_id}/participants/import", status_code=201)
-async def import_participants(
+@router.post("/events/{event_id}/participants/add-users", status_code=201)
+async def add_registered_users_to_event(
     event_id: int,
-    payload: ParticipantImport,
+    payload: ParticipantAssignUsers,
     current_user: dict[str, Any] = Depends(require_roles("superadmin", "division_admin")),
 ) -> dict[str, Any]:
     pool = get_db_pool()
     async with pool.acquire() as connection:
         event_exists = await connection.fetchval("SELECT id FROM events WHERE id = $1", event_id)
         if not event_exists:
-            raise HTTPException(status_code=404, detail="Мероприятие не найдено")
+            raise HTTPException(status_code=404, detail="Event not found")
+
+        users = await connection.fetch(
+            """
+            SELECT id, full_name, email
+            FROM users
+            WHERE id = ANY($1::int[])
+            """,
+            payload.user_ids,
+        )
+        user_by_id = {user["id"]: user for user in users}
+
+        missing_user_ids = [user_id for user_id in payload.user_ids if user_id not in user_by_id]
+        if len(missing_user_ids) == len(payload.user_ids):
+            raise HTTPException(status_code=400, detail="No registered users were found")
+
+        existing_email_records = await connection.fetch(
+            """
+            SELECT email
+            FROM participants
+            WHERE event_id = $1 AND email = ANY($2::varchar[])
+            """,
+            event_id,
+            [user["email"] for user in users],
+        )
+        existing_email_values = {record["email"] for record in existing_email_records}
 
         inserted = 0
-        for participant in payload.participants:
+        skipped_existing = 0
+        for user_id in payload.user_ids:
+            user = user_by_id.get(user_id)
+            if not user:
+                continue
+            if user["email"] in existing_email_values:
+                skipped_existing += 1
+                continue
+
             await connection.execute(
                 """
                 INSERT INTO participants (
@@ -124,22 +180,34 @@ async def import_participants(
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
                 event_id,
-                participant.full_name,
-                participant.email,
-                participant.status,
-                participant.achievement,
-                participant.hours,
-                participant.award_category,
+                user["full_name"],
+                user["email"],
+                payload.status,
+                payload.achievement,
+                payload.hours,
+                payload.award_category or (AWARD_CATEGORIES[0] if AWARD_CATEGORIES else ""),
                 uuid4().hex,
             )
             inserted += 1
+            existing_email_values.add(user["email"])
 
         await add_audit_log(
             connection,
             actor=current_user,
-            action="participants.imported",
+            action="participants.added_from_registered_users",
             entity_type="event",
             entity_id=event_id,
-            details={"count": inserted},
+            details={
+                "requested": len(payload.user_ids),
+                "inserted": inserted,
+                "skipped_existing": skipped_existing,
+                "missing_user_ids": missing_user_ids,
+            },
         )
-        return {"inserted": inserted}
+
+        return {
+            "requested": len(payload.user_ids),
+            "inserted": inserted,
+            "skipped_existing": skipped_existing,
+            "missing_user_ids": missing_user_ids,
+        }

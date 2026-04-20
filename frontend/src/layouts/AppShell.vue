@@ -4,7 +4,7 @@
       <div class="shell-brand" @click="goHome">
         <div class="brand-mark">TO</div>
         <div>
-          <strong>TOGU Docs</strong>
+          <strong>Документы ТОГУ</strong>
           <p>Выпуск и верификация документов мероприятий</p>
         </div>
       </div>
@@ -13,7 +13,7 @@
         <template v-if="user">
           <div class="user-chip">
             <span>{{ user.full_name }}</span>
-            <small>{{ user.role_label }}</small>
+            <small v-if="isSuperadmin">{{ user.role_label }}</small>
           </div>
           <el-button type="danger" plain @click="logout">Выйти</el-button>
         </template>
@@ -31,16 +31,18 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api/axios'
+import { clearAuthSession, getAccessToken } from '../utils/authToken'
 
 const router = useRouter()
 const user = ref(null)
+const isSuperadmin = computed(() => user.value?.role === 'superadmin')
 
 const refreshUser = async () => {
-  const token = localStorage.getItem('access_token')
+  const token = getAccessToken()
   if (!token) {
     user.value = null
     return
@@ -50,20 +52,24 @@ const refreshUser = async () => {
     const { data } = await api.get('/auth/me')
     user.value = data
     localStorage.setItem('user_email', data.email)
-  } catch {
-    localStorage.removeItem('access_token')
-    localStorage.removeItem('user_email')
+  } catch (error) {
+    const status = error?.response?.status
+    if (status === 401 || status === 403) {
+      clearAuthSession()
+      user.value = null
+      return
+    }
+    // Keep token on transient backend/network issues to avoid forced logout loops.
     user.value = null
   }
 }
 
 const goHome = () => {
-  router.push(user.value ? '/dashboard' : '/login')
+  router.push('/')
 }
 
 const logout = () => {
-  localStorage.removeItem('access_token')
-  localStorage.removeItem('user_email')
+  clearAuthSession()
   user.value = null
   ElMessage.success('Сессия завершена')
   router.push('/login')

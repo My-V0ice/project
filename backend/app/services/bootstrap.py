@@ -1,11 +1,14 @@
 from datetime import datetime
+import json
 from uuid import uuid4
 
 import asyncpg
 
 from app.core.config import FRONTEND_URL
+from app.core.security import get_password_hash
 from app.db import get_db_pool
 from app.services.audit import add_audit_log
+from app.services.document_assets import ensure_document_assets
 
 
 SCHEMA_SQL = """
@@ -110,124 +113,203 @@ async def create_schema(connection: asyncpg.Connection) -> None:
 async def seed_initial_data() -> None:
     pool = get_db_pool()
     async with pool.acquire() as connection:
+        user_count = await connection.fetchval("SELECT COUNT(*) FROM users")
+        if not user_count:
+            demo_password_hash = get_password_hash("password123")
+            demo_users = [
+                ("admin@togu.example", "Системный администратор", "superadmin"),
+                ("manager@togu.example", "Администратор подразделения", "division_admin"),
+                ("recipient@togu.example", "Основной получатель", "recipient"),
+                ("reviewer@togu.example", "Проверяющий реестра", "reviewer"),
+                ("auditor@togu.example", "Аудитор системы", "auditor"),
+            ]
+            for idx in range(1, 16):
+                demo_users.append((f"user{idx}@togu.example", f"Тестовый пользователь {idx}", "recipient"))
+
+            for email, full_name, role in demo_users:
+                await connection.execute(
+                    """
+                    INSERT INTO users (
+                        email, full_name, hashed_password, role, brand_name, division_name, consent_to_processing
+                    )
+                    VALUES ($1, $2, $3, $4, 'ТОГУ', 'Цифровая кафедра', TRUE)
+                    ON CONFLICT (email) DO NOTHING
+                    """,
+                    email,
+                    full_name,
+                    demo_password_hash,
+                    role,
+                )
+
+        created_by = await connection.fetchval("SELECT id FROM users WHERE email = 'admin@togu.example'")
+        if not created_by:
+            created_by = await connection.fetchval("SELECT id FROM users ORDER BY id ASC LIMIT 1")
+
         event_count = await connection.fetchval("SELECT COUNT(*) FROM events")
-        if event_count:
-            return
-
-        event_id = await connection.fetchval(
-            """
-            INSERT INTO events (
-                title, organizer, start_date, end_date, event_type, description,
-                contact_email, brand_name, division_name, created_by, status
-            )
-            VALUES (
-                'Форум студенческих инициатив',
-                'ТОГУ',
-                CURRENT_DATE - 5,
-                CURRENT_DATE - 4,
-                'Форум',
-                'Пилотное мероприятие для демонстрации выпуска документов.',
-                'events@togu.example',
-                'ТОГУ',
-                'Управление молодежной политики',
-                NULL,
-                'completed'
-            )
-            RETURNING id
-            """
-        )
-
-        template_id = await connection.fetchval(
-            """
-            INSERT INTO templates (
-                name, orientation, description, allowed_fields, brand_book_locked,
-                brand_name, created_by, layout_config
-            )
-            VALUES (
-                'Сертификат участника ТОГУ',
-                'landscape',
-                'Базовый шаблон по брендбуку ТОГУ.',
-                $1::jsonb,
-                TRUE,
-                'ТОГУ',
-                NULL,
-                $2::jsonb
-            )
-            RETURNING id
-            """,
-            [
-                "full_name",
-                "status",
-                "event_title",
-                "event_date",
-                "hours",
-                "document_number",
-                "qr_link",
-                "signatory_name",
-                "signatory_position",
-            ],
-            {
-                "colors": {"primary": "#9d2235", "secondary": "#f6efe7"},
-                "fonts": ["Montserrat", "PT Sans"],
-                "page": "A4",
-                "grid": "brand-locked",
-            },
-        )
-
-        participants = [
-            ("Иванова Мария Сергеевна", "maria@example.com", "Подтвержден", "Активное участие в программе", 12, "Участник"),
-            ("Петров Артем Игоревич", "artem@example.com", "Подтвержден", "Лучший проект секции", 16, "Победитель"),
-            ("Смирнова Елена Андреевна", "elena@example.com", "Подтвержден", "Организация волонтерской команды", 24, "Волонтер"),
-        ]
-
-        for full_name, email, status_name, achievement, hours, award_category in participants:
-            participant_id = await connection.fetchval(
-                """
-                INSERT INTO participants (
-                    event_id, full_name, email, status, achievement, hours, award_category, personal_link_token
+        if not event_count:
+            events = [
+                ("Форум студенческих инициатив", 40, "Форум", "Управление молодежной политики"),
+                ("Школа проектного управления", 32, "Практикум", "Инженерная школа"),
+                ("Олимпиада по цифровым технологиям", 26, "Олимпиада", "Институт математики"),
+                ("Научно-исследовательская конференция", 20, "Конференция", "Научный отдел"),
+                ("Школа волонтеров ТОГУ", 15, "Школа", "Центр волонтерства"),
+                ("Хакатон ИТ-решений", 8, "Хакатон", "Цифровая кафедра"),
+            ]
+            for title, day_shift, event_type, division in events:
+                await connection.execute(
+                    """
+                    INSERT INTO events (
+                        title, organizer, start_date, end_date, event_type, description,
+                        contact_email, brand_name, division_name, created_by, status
+                    )
+                    VALUES ($1, 'ТОГУ', CURRENT_DATE - $2::int, CURRENT_DATE - ($2::int - 1), $3, $4, $5, 'ТОГУ', $6, $7, 'completed')
+                    """,
+                    title,
+                    day_shift,
+                    event_type,
+                    f"Мероприятие «{title}» в рамках учебной и научной деятельности.",
+                    "events@togu.example",
+                    division,
+                    created_by,
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id
-                """,
-                event_id,
-                full_name,
-                email,
-                status_name,
-                achievement,
-                hours,
-                award_category,
-                uuid4().hex,
-            )
 
-            document_number = f"TOGU-{datetime.now().year}-{participant_id:05d}"
-            verification_code = uuid4().hex[:12]
-            await connection.execute(
-                """
-                INSERT INTO documents (
-                    event_id, participant_id, template_id, number, verification_code, qr_link,
-                    pdf_url, archive_url, image_url, signature_status, signature_type,
-                    signatory_name, signatory_position, issued_by, issued_at, status, email_sent_at
-                )
-                VALUES (
-                    $1, $2, $3, $4, $5, $6,
-                    $7, $8, $9, $10, $11,
-                    $12, $13, NULL, CURRENT_TIMESTAMP, 'issued', CURRENT_TIMESTAMP
-                )
-                """,
-                event_id,
-                participant_id,
-                template_id,
-                document_number,
-                verification_code,
-                f"{FRONTEND_URL}/verify/{verification_code}",
-                f"/documents/{document_number}.pdf",
-                f"/documents/{document_number}.pdfa",
-                f"/documents/{document_number}.png",
-                "Подписан УКЭП",
-                "УКЭП",
-                "Дирекция форума",
-                "Руководитель проекта",
+        template_count = await connection.fetchval("SELECT COUNT(*) FROM templates")
+        if not template_count:
+            allowed_fields = json.dumps(
+                [
+                    "full_name",
+                    "status",
+                    "event_title",
+                    "event_date",
+                    "hours",
+                    "document_number",
+                    "qr_link",
+                    "signatory_name",
+                    "signatory_position",
+                ]
             )
+            layout = json.dumps(
+                {
+                    "colors": {"primary": "#9d2235", "secondary": "#f6efe7"},
+                    "fonts": ["Montserrat", "PT Sans"],
+                    "page": "A4",
+                    "grid": "brand-locked",
+                }
+            )
+            templates = [
+                ("Сертификат участника ТОГУ", "landscape", "Стандартный сертификат участника."),
+                ("Диплом победителя ТОГУ", "portrait", "Официальный шаблон диплома победителя."),
+                ("Благодарственное письмо ТОГУ", "landscape", "Шаблон благодарственного письма."),
+                ("Сертификат волонтера ТОГУ", "portrait", "Сертификат для волонтеров мероприятий."),
+                ("Сертификат спикера ТОГУ", "landscape", "Сертификат для докладчиков и спикеров."),
+            ]
+            for name, orientation, description in templates:
+                await connection.execute(
+                    """
+                    INSERT INTO templates (
+                        name, orientation, description, allowed_fields, brand_book_locked,
+                        brand_name, created_by, layout_config
+                    )
+                    VALUES ($1, $2, $3, $4::jsonb, TRUE, 'ТОГУ', $5, $6::jsonb)
+                    """,
+                    name,
+                    orientation,
+                    description,
+                    allowed_fields,
+                    created_by,
+                    layout,
+                )
+
+        document_count = await connection.fetchval("SELECT COUNT(*) FROM documents")
+        if not document_count:
+            events = await connection.fetch("SELECT id, title FROM events ORDER BY id ASC")
+            templates = await connection.fetch("SELECT id FROM templates ORDER BY id ASC")
+
+            participants_pool = [
+                ("Иван Иванов", "ivan.ivanov@togu.example"),
+                ("Мария Петрова", "maria.petrova@togu.example"),
+                ("Алексей Смирнов", "alexey.smirnov@togu.example"),
+                ("Елена Соколова", "elena.sokolova@togu.example"),
+                ("Дмитрий Кузнецов", "dmitriy.kuznetsov@togu.example"),
+                ("Ольга Васильева", "olga.vasilieva@togu.example"),
+                ("Сергей Николаев", "sergey.nikolaev@togu.example"),
+                ("Наталья Орлова", "natalya.orlova@togu.example"),
+                ("Артем Морозов", "artem.morozov@togu.example"),
+                ("Алина Федорова", "alina.fedorova@togu.example"),
+                ("Виктор Громов", "viktor.gromov@togu.example"),
+                ("Юлия Крылова", "yulia.krylova@togu.example"),
+                ("Кирилл Лебедев", "kirill.lebedev@togu.example"),
+                ("Татьяна Борисова", "tatyana.borisova@togu.example"),
+                ("Павел Ефимов", "pavel.efimov@togu.example"),
+                ("Анна Макарова", "anna.makarova@togu.example"),
+                ("Владимир Ковалев", "vladimir.kovalev@togu.example"),
+                ("Ксения Жукова", "kseniya.zhukova@togu.example"),
+                ("Роман Белов", "roman.belov@togu.example"),
+                ("Светлана Тихонова", "svetlana.tikhonova@togu.example"),
+            ]
+            categories = ["Участник", "Призер", "Победитель", "Спикер", "Волонтер"]
+
+            if events and templates:
+                for event_index, event in enumerate(events):
+                    for row in range(12):
+                        person = participants_pool[(event_index * 12 + row) % len(participants_pool)]
+                        full_name = person[0]
+                        email = person[1].replace("@", f"+e{event_index + 1}r{row + 1}@")
+                        award_category = categories[(event_index + row) % len(categories)]
+                        hours = 8 + (row % 10)
+                        achievement = f"Активное участие в мероприятии «{event['title']}»."
+
+                        participant_id = await connection.fetchval(
+                            """
+                            INSERT INTO participants (
+                                event_id, full_name, email, status, achievement, hours, award_category, personal_link_token
+                            )
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                            RETURNING id
+                            """,
+                            event["id"],
+                            full_name,
+                            email,
+                            "Подтвержден",
+                            achievement,
+                            hours,
+                            award_category,
+                            uuid4().hex,
+                        )
+
+                        template_id = templates[(event_index + row) % len(templates)]["id"]
+                        document_number = f"TOGU-{datetime.now().year}-{participant_id:05d}"
+                        verification_code = uuid4().hex[:12]
+                        await connection.execute(
+                            """
+                            INSERT INTO documents (
+                                event_id, participant_id, template_id, number, verification_code, qr_link,
+                                pdf_url, archive_url, image_url, signature_status, signature_type,
+                                signatory_name, signatory_position, issued_by, issued_at, status, email_sent_at
+                            )
+                            VALUES (
+                                $1, $2, $3, $4, $5, $6,
+                                $7, $8, $9, $10, $11,
+                                $12, $13, $14, CURRENT_TIMESTAMP - ($15::int || ' days')::interval, 'issued', CURRENT_TIMESTAMP
+                            )
+                            """,
+                            event["id"],
+                            participant_id,
+                            template_id,
+                            document_number,
+                            verification_code,
+                            f"{FRONTEND_URL}/verify/{verification_code}",
+                            f"/documents/{document_number}.pdf",
+                            f"/documents/{document_number}.pdfa",
+                            f"/documents/{document_number}.png",
+                            "Подписан",
+                            "УКЭП",
+                            "Администрация ТОГУ",
+                            "Руководитель проекта",
+                            created_by,
+                            (event_index + row + 1),
+                        )
+                        ensure_document_assets(document_number)
 
         await add_audit_log(
             connection,
@@ -235,5 +317,5 @@ async def seed_initial_data() -> None:
             action="seed.initialized",
             entity_type="system",
             entity_id=None,
-            details={"message": "Созданы демонстрационные данные для панели управления"},
+            details={"message": "Демо-данные расширены: пользователи, шаблоны, мероприятия и документы"},
         )

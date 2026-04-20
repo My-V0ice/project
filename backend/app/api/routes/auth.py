@@ -5,13 +5,14 @@ from fastapi.security import OAuth2PasswordRequestForm
 
 from app.core.security import create_access_token, get_password_hash, verify_password
 from app.db import get_db_pool
-from app.deps import get_current_user
-from app.schemas.auth import Token, UserCreate, UserResponse
+from app.deps import get_current_user, require_roles
+from app.schemas.auth import Token, UserCreate, UserResponse, UserRoleUpdate
 from app.services.audit import add_audit_log
 from app.utils.users import normalize_user
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+DEFAULT_REGISTER_ROLE = "recipient"
 
 
 @router.post("/register", response_model=UserResponse, status_code=201)
@@ -31,7 +32,7 @@ async def register(user: UserCreate) -> UserResponse:
             user.email,
             user.full_name,
             get_password_hash(user.password),
-            user.role,
+            DEFAULT_REGISTER_ROLE,
             user.brand_name,
             user.division_name,
         )
@@ -42,7 +43,7 @@ async def register(user: UserCreate) -> UserResponse:
             action="user.registered",
             entity_type="user",
             entity_id=record["id"],
-            details={"email": user.email, "role": user.role},
+            details={"email": user.email, "role": DEFAULT_REGISTER_ROLE},
         )
         return UserResponse(**normalized)
 
@@ -78,3 +79,83 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()) -> Token:
 @router.get("/me", response_model=UserResponse)
 async def auth_me(current_user: dict[str, Any] = Depends(get_current_user)) -> UserResponse:
     return UserResponse(**current_user)
+
+
+@router.get("/users", response_model=list[UserResponse])
+async def list_users(
+    current_user: dict[str, Any] = Depends(require_roles("superadmin")),
+) -> list[UserResponse]:
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        records = await connection.fetch(
+            """
+            SELECT id, email, full_name, role, brand_name, division_name, consent_to_processing
+            FROM users
+            ORDER BY id DESC
+            """
+        )
+        return [UserResponse(**normalize_user(record)) for record in records]
+
+
+@router.get("/users/{user_id}", response_model=UserResponse)
+async def get_user_by_id(
+    user_id: int,
+) -> UserResponse:
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        record = await connection.fetchrow(
+            """
+            SELECT id, email, full_name, role, brand_name, division_name, consent_to_processing
+            FROM users
+            WHERE id = $1
+            """,
+            user_id,
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        return UserResponse(**normalize_user(record))
+
+
+@router.patch("/users/{user_id}/role", response_model=UserResponse)
+async def update_user_role(
+    user_id: int,
+    payload: UserRoleUpdate,
+    current_user: dict[str, Any] = Depends(require_roles("superadmin")),
+) -> UserResponse:
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        existing = await connection.fetchrow(
+            """
+            SELECT id, email, full_name, role, brand_name, division_name, consent_to_processing
+            FROM users
+            WHERE id = $1
+            """,
+            user_id,
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+        record = await connection.fetchrow(
+            """
+            UPDATE users
+            SET role = $1
+            WHERE id = $2
+            RETURNING id, email, full_name, role, brand_name, division_name, consent_to_processing
+            """,
+            payload.role,
+            user_id,
+        )
+        normalized = normalize_user(record)
+        await add_audit_log(
+            connection,
+            actor=current_user,
+            action="user.role_updated",
+            entity_type="user",
+            entity_id=user_id,
+            details={
+                "email": normalized["email"],
+                "old_role": existing["role"],
+                "new_role": payload.role,
+            },
+        )
+        return UserResponse(**normalized)

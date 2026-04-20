@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { getAccessToken } from '../utils/authToken'
 
 import { routes } from './routes'
 
@@ -8,11 +9,25 @@ const router = createRouter({
   routes,
 })
 
-router.beforeEach((to) => {
-  const token = localStorage.getItem('access_token')
+const getRoleFromToken = (token) => {
+  if (!token) return null
 
-  if (to.meta.requiresAuth && !token) {
-    return '/login'
+  try {
+    const payload = token.split('.')[1]
+    if (!payload) return null
+    const decoded = JSON.parse(atob(payload))
+    return decoded?.role || null
+  } catch {
+    return null
+  }
+}
+
+router.beforeEach((to) => {
+  const token = getAccessToken()
+  const role = getRoleFromToken(token)
+
+  if (to.meta.requiresAdmin && role !== 'superadmin') {
+    return '/dashboard'
   }
 
   if (to.meta.guest && token) {
