@@ -10,6 +10,11 @@ class UserCreate(BaseModel):
     brand_name: str = Field(default="\u0422\u041e\u0413\u0423", max_length=150)
     division_name: str = Field(default="\u0426\u0438\u0444\u0440\u043e\u0432\u0430\u044f \u043a\u0430\u0444\u0435\u0434\u0440\u0430", max_length=150)
 
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).strip().lower()
+
     @field_validator("password")
     @classmethod
     def validate_password(cls, value: str) -> str:

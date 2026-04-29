@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS documents (
     status VARCHAR(30) NOT NULL DEFAULT 'issued'
 );
 
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS qr_image_url TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id SERIAL PRIMARY KEY,
     actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
@@ -101,6 +103,65 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     entity_type VARCHAR(60) NOT NULL,
     entity_id INTEGER NULL,
     details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS brand_settings (
+    id SERIAL PRIMARY KEY,
+    brand_name VARCHAR(150) UNIQUE NOT NULL,
+    primary_color VARCHAR(20) NOT NULL DEFAULT '#9b2242',
+    secondary_color VARCHAR(20) NOT NULL DEFAULT '#ffffff',
+    font_family VARCHAR(150) NOT NULL DEFAULT 'Arial',
+    logo_svg TEXT NOT NULL DEFAULT '',
+    page_margin_mm INTEGER NOT NULL DEFAULT 22,
+    grid_step_mm INTEGER NOT NULL DEFAULT 5,
+    locked BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS consent_history (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    consent_to_processing BOOLEAN NOT NULL,
+    changed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    source VARCHAR(60) NOT NULL DEFAULT 'account',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS participant_import_batches (
+    id SERIAL PRIMARY KEY,
+    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    uploaded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    filename VARCHAR(255) NOT NULL,
+    field_mapping JSONB NOT NULL DEFAULT '{}'::jsonb,
+    rows_total INTEGER NOT NULL DEFAULT 0,
+    rows_valid INTEGER NOT NULL DEFAULT 0,
+    rows_imported INTEGER NOT NULL DEFAULT 0,
+    rows_failed INTEGER NOT NULL DEFAULT 0,
+    status VARCHAR(30) NOT NULL DEFAULT 'preview',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS participant_import_rows (
+    id SERIAL PRIMARY KEY,
+    batch_id INTEGER NOT NULL REFERENCES participant_import_batches(id) ON DELETE CASCADE,
+    row_number INTEGER NOT NULL,
+    raw_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    normalized_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+    imported_participant_id INTEGER REFERENCES participants(id) ON DELETE SET NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS email_logs (
+    id SERIAL PRIMARY KEY,
+    document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+    recipient_email VARCHAR(255) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    body TEXT NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    error_message TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -113,6 +174,29 @@ async def create_schema(connection: asyncpg.Connection) -> None:
 async def seed_initial_data() -> None:
     pool = get_db_pool()
     async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO brand_settings (
+                brand_name, primary_color, secondary_color, font_family, page_margin_mm, grid_step_mm, locked
+            )
+            VALUES ('ТОГУ', '#9b2242', '#ffffff', 'Arial', 22, 5, TRUE)
+            ON CONFLICT (brand_name) DO NOTHING
+            """
+        )
+        await connection.execute(
+            """
+            UPDATE documents
+            SET pdf_url = '/documents/files/' || number || '/pdf',
+                archive_url = '/documents/files/' || number || '/pdfa',
+                image_url = '/documents/files/' || number || '/png',
+                qr_image_url = '/documents/files/' || number || '/qr'
+            WHERE pdf_url NOT LIKE '/documents/files/%'
+               OR archive_url NOT LIKE '/documents/files/%'
+               OR image_url NOT LIKE '/documents/files/%'
+               OR qr_image_url = ''
+            """
+        )
+
         user_count = await connection.fetchval("SELECT COUNT(*) FROM users")
         if not user_count:
             demo_password_hash = get_password_hash("password123")
@@ -284,13 +368,13 @@ async def seed_initial_data() -> None:
                             """
                             INSERT INTO documents (
                                 event_id, participant_id, template_id, number, verification_code, qr_link,
-                                pdf_url, archive_url, image_url, signature_status, signature_type,
+                                pdf_url, archive_url, image_url, qr_image_url, signature_status, signature_type,
                                 signatory_name, signatory_position, issued_by, issued_at, status, email_sent_at
                             )
                             VALUES (
                                 $1, $2, $3, $4, $5, $6,
-                                $7, $8, $9, $10, $11,
-                                $12, $13, $14, CURRENT_TIMESTAMP - ($15::int || ' days')::interval, 'issued', CURRENT_TIMESTAMP
+                                $7, $8, $9, $10, $11, $12,
+                                $13, $14, $15, CURRENT_TIMESTAMP - ($16::int || ' days')::interval, 'issued', CURRENT_TIMESTAMP
                             )
                             """,
                             event["id"],
@@ -299,9 +383,10 @@ async def seed_initial_data() -> None:
                             document_number,
                             verification_code,
                             f"{FRONTEND_URL}/verify/{verification_code}",
-                            f"/documents/{document_number}.pdf",
-                            f"/documents/{document_number}.pdfa",
-                            f"/documents/{document_number}.png",
+                            f"/documents/files/{document_number}/pdf",
+                            f"/documents/files/{document_number}/pdfa",
+                            f"/documents/files/{document_number}/png",
+                            f"/documents/files/{document_number}/qr",
                             "Подписан",
                             "УКЭП",
                             "Администрация ТОГУ",

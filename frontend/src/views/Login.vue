@@ -31,7 +31,7 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import axios from 'axios'
+import api from '../api/axios'
 import { clearAuthSession, setAccessToken } from '../utils/authToken'
 
 const router = useRouter()
@@ -65,11 +65,9 @@ const handleLogin = async () => {
     payload.append('username', form.email)
     payload.append('password', form.password)
 
-    const response = await axios.post(
-      `${import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'}/auth/login`,
-      payload,
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
-    )
+    const response = await api.post('/auth/login', payload, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    })
 
     const token = setAccessToken(response.data.access_token)
     if (!token) {

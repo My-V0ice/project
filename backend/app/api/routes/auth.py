@@ -15,11 +15,16 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 DEFAULT_REGISTER_ROLE = "recipient"
 
 
+def normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
 @router.post("/register", response_model=UserResponse, status_code=201)
 async def register(user: UserCreate) -> UserResponse:
+    normalized_email = normalize_email(str(user.email))
     pool = get_db_pool()
     async with pool.acquire() as connection:
-        existing = await connection.fetchrow("SELECT id FROM users WHERE email = $1", user.email)
+        existing = await connection.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1", normalized_email)
         if existing:
             raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
 
@@ -29,7 +34,7 @@ async def register(user: UserCreate) -> UserResponse:
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING id, email, full_name, role, brand_name, division_name, consent_to_processing
             """,
-            user.email,
+            normalized_email,
             user.full_name,
             get_password_hash(user.password),
             DEFAULT_REGISTER_ROLE,
@@ -43,22 +48,23 @@ async def register(user: UserCreate) -> UserResponse:
             action="user.registered",
             entity_type="user",
             entity_id=record["id"],
-            details={"email": user.email, "role": DEFAULT_REGISTER_ROLE},
+            details={"email": normalized_email, "role": DEFAULT_REGISTER_ROLE},
         )
         return UserResponse(**normalized)
 
 
 @router.post("/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()) -> Token:
+    normalized_email = normalize_email(form_data.username)
     pool = get_db_pool()
     async with pool.acquire() as connection:
         record = await connection.fetchrow(
             """
             SELECT id, email, full_name, hashed_password, role, brand_name, division_name, consent_to_processing
             FROM users
-            WHERE email = $1
+            WHERE LOWER(email) = $1
             """,
-            form_data.username,
+            normalized_email,
         )
         if not record or not verify_password(form_data.password, record["hashed_password"]):
             raise HTTPException(status_code=401, detail="Неверный email или пароль")
@@ -100,7 +106,10 @@ async def list_users(
 @router.get("/users/{user_id}", response_model=UserResponse)
 async def get_user_by_id(
     user_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> UserResponse:
+    if current_user["role"] not in {"superadmin", "auditor"} and current_user["id"] != user_id:
+        raise HTTPException(status_code=403, detail="Недостаточно прав для просмотра пользователя")
     pool = get_db_pool()
     async with pool.acquire() as connection:
         record = await connection.fetchrow(

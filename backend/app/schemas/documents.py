@@ -18,6 +18,11 @@ class TemplateCreate(BaseModel):
             "signatory_position",
         ]
     )
+    layout_config: dict = Field(default_factory=dict)
+
+
+class TemplateLayoutUpdate(BaseModel):
+    layout_config: dict = Field(default_factory=dict)
 
 
 class IssueDocumentsRequest(BaseModel):

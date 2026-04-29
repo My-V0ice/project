@@ -154,6 +154,45 @@
               <el-button type="primary" class="top-gap" @click="addRegisteredUsersToEvent">Добавить в мероприятие</el-button>
             </el-card>
 
+            <el-card v-if="canManageEvents">
+              <template #header>Импорт участников CSV/XLSX</template>
+              <el-select v-model="selectedEventId" placeholder="Выберите мероприятие" class="w-full">
+                <el-option v-for="event in events" :key="event.id" :label="event.title" :value="event.id" />
+              </el-select>
+              <input class="file-input top-gap" type="file" accept=".csv,.xlsx" @change="handleImportFileChange" />
+              <div v-if="importPreview" class="import-summary">
+                <div class="verify-grid">
+                  <div class="verify-item">
+                    <span>Всего строк</span>
+                    <strong>{{ importPreview.rows_total }}</strong>
+                  </div>
+                  <div class="verify-item">
+                    <span>Готово к импорту</span>
+                    <strong>{{ importPreview.rows_valid }}</strong>
+                  </div>
+                  <div class="verify-item">
+                    <span>Ошибки</span>
+                    <strong>{{ importPreview.rows_failed }}</strong>
+                  </div>
+                </div>
+                <el-table :data="importPreview.sample" size="small">
+                  <el-table-column prop="row_number" label="#" width="70" />
+                  <el-table-column label="ФИО" min-width="180">
+                    <template #default="{ row }">{{ row.data.full_name }}</template>
+                  </el-table-column>
+                  <el-table-column label="Email" min-width="180">
+                    <template #default="{ row }">{{ row.data.email }}</template>
+                  </el-table-column>
+                  <el-table-column label="Ошибки" min-width="180">
+                    <template #default="{ row }">{{ row.errors.join(', ') || 'Нет' }}</template>
+                  </el-table-column>
+                </el-table>
+                <el-button type="primary" class="top-gap" :disabled="!importPreview.rows_valid" @click="commitParticipantImport">
+                  Импортировать валидные строки
+                </el-button>
+              </div>
+            </el-card>
+
             <el-card>
               <template #header>Участники мероприятия</template>
               <el-table :data="participants" empty-text="Выберите мероприятие">
@@ -168,7 +207,7 @@
         </el-tab-pane>
 
         <el-tab-pane label="Шаблоны" name="templates">
-          <div class="grid-two">
+          <div class="template-workbench">
             <el-card v-if="canManageEvents">
               <template #header>Конструктор шаблона</template>
               <el-form :model="templateForm" label-position="top">
@@ -189,13 +228,16 @@
                     <el-option v-for="field in templateFields" :key="field" :label="field" :value="field" />
                   </el-select>
                 </el-form-item>
-                <el-button type="primary" @click="createTemplate">Сохранить шаблон</el-button>
+                <div class="document-actions">
+                  <el-button type="primary" @click="createTemplate">Создать шаблон</el-button>
+                  <el-button :disabled="!selectedTemplateId" @click="saveTemplateLayout">Сохранить макет</el-button>
+                </div>
               </el-form>
             </el-card>
 
             <el-card>
               <template #header>Список шаблонов</template>
-              <el-table :data="templates">
+              <el-table :data="templates" highlight-current-row @current-change="selectTemplate">
                 <el-table-column prop="name" label="Шаблон" min-width="220" />
                 <el-table-column prop="orientation" label="Ориентация" width="130" />
                 <el-table-column prop="brand_book_locked" label="Брендбук" width="100">
@@ -205,34 +247,192 @@
               </el-table>
             </el-card>
           </div>
+
+          <div class="template-designer">
+            <el-card>
+              <template #header>
+                <div class="document-details-header">
+                  <div>
+                    <p class="document-details-eyebrow">Визуальный редактор</p>
+                    <h2>{{ selectedTemplate?.name || 'Выберите шаблон' }}</h2>
+                  </div>
+                  <el-tag type="primary">A4 {{ designer.orientation === 'landscape' ? 'горизонтально' : 'вертикально' }}</el-tag>
+                </div>
+              </template>
+
+              <div class="designer-toolbar">
+                <el-select v-model="newElementField" placeholder="Переменная" class="designer-toolbar__select">
+                  <el-option v-for="field in templateFields" :key="field" :label="field" :value="field" />
+                </el-select>
+                <el-button @click="addDesignerElement('variable')">Добавить текст</el-button>
+                <el-button @click="addDesignerElement('qr')">QR</el-button>
+                <el-button @click="addDesignerElement('signature')">Подпись</el-button>
+                <el-button :disabled="!selectedElement" @click="duplicateDesignerElement">Дублировать</el-button>
+                <el-button :disabled="!selectedElement" type="danger" plain @click="removeDesignerElement">Удалить</el-button>
+              </div>
+
+              <div class="designer-layout">
+                <div
+                  class="designer-canvas"
+                  :class="`designer-canvas--${designer.orientation}`"
+                  @pointermove="moveDesignerElement"
+                  @pointerup="finishDesignerDrag"
+                  @pointerleave="finishDesignerDrag"
+                >
+                  <div class="designer-page">
+                    <div class="designer-safe-area"></div>
+                    <div
+                      v-for="element in sortedDesignerElements"
+                      :key="element.id"
+                      class="designer-element"
+                      :class="[
+                        `designer-element--${element.type}`,
+                        { 'designer-element--active': selectedElementId === element.id },
+                      ]"
+                      :style="designerElementStyle(element)"
+                      @pointerdown.stop="startDesignerDrag($event, element)"
+                      @click.stop="selectedElementId = element.id"
+                    >
+                      <span>{{ element.label }}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <aside class="designer-side">
+                  <template v-if="selectedElement">
+                    <el-form label-position="top">
+                      <el-form-item label="Слой">
+                        <el-input v-model="selectedElement.label" />
+                      </el-form-item>
+                      <div class="grid-two compact-grid">
+                        <el-form-item label="X, %">
+                          <el-input-number v-model="selectedElement.x" :min="0" :max="100" />
+                        </el-form-item>
+                        <el-form-item label="Y, %">
+                          <el-input-number v-model="selectedElement.y" :min="0" :max="100" />
+                        </el-form-item>
+                        <el-form-item label="Ширина, %">
+                          <el-input-number v-model="selectedElement.w" :min="4" :max="100" />
+                        </el-form-item>
+                        <el-form-item label="Высота, %">
+                          <el-input-number v-model="selectedElement.h" :min="3" :max="40" />
+                        </el-form-item>
+                      </div>
+                      <el-form-item label="Размер текста">
+                        <el-slider v-model="selectedElement.fontSize" :min="10" :max="52" />
+                      </el-form-item>
+                      <el-form-item label="Выравнивание">
+                        <el-radio-group v-model="selectedElement.align">
+                          <el-radio-button label="left">Слева</el-radio-button>
+                          <el-radio-button label="center">Центр</el-radio-button>
+                          <el-radio-button label="right">Справа</el-radio-button>
+                        </el-radio-group>
+                      </el-form-item>
+                      <el-form-item label="Автоперенос">
+                        <el-switch v-model="selectedElement.wrap" active-text="Включен" />
+                      </el-form-item>
+                    </el-form>
+                  </template>
+                  <el-empty v-else description="Выберите слой на макете" />
+
+                  <div class="layer-list">
+                    <p class="document-details-eyebrow">Слои</p>
+                    <button
+                      v-for="element in sortedDesignerElements"
+                      :key="element.id"
+                      class="layer-list__item"
+                      :class="{ 'layer-list__item--active': selectedElementId === element.id }"
+                      @click="selectedElementId = element.id"
+                    >
+                      {{ element.label }}
+                    </button>
+                  </div>
+                </aside>
+              </div>
+            </el-card>
+          </div>
         </el-tab-pane>
 
         <el-tab-pane label="Документы" name="documents">
           <div class="grid-two">
             <el-card v-if="canIssueDocuments">
-              <template #header>Выпуск документов</template>
-              <el-form :model="issueForm" label-position="top">
-                <el-form-item label="Мероприятие">
-                  <el-select v-model="issueForm.event_id" class="w-full">
-                    <el-option v-for="event in events" :key="event.id" :label="event.title" :value="event.id" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="Шаблон">
-                  <el-select v-model="issueForm.template_id" class="w-full">
-                    <el-option v-for="template in templates" :key="template.id" :label="template.name" :value="template.id" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="Подписант">
-                  <el-input v-model="issueForm.signatory_name" />
-                </el-form-item>
-                <el-form-item label="Должность">
-                  <el-input v-model="issueForm.signatory_position" />
-                </el-form-item>
-                <el-form-item label="Рассылка">
-                  <el-switch v-model="issueForm.send_email" active-text="Отправить по email" />
-                </el-form-item>
-                <el-button type="primary" @click="issueDocuments">Выпустить пакет</el-button>
-              </el-form>
+              <template #header>Мастер выпуска</template>
+              <el-steps :active="issueStep" finish-status="success" class="issue-steps">
+                <el-step title="Импорт" />
+                <el-step title="Поля" />
+                <el-step title="Предпросмотр" />
+                <el-step title="Выпуск" />
+              </el-steps>
+
+              <div class="wizard-panel">
+                <div v-if="issueStep === 0">
+                  <el-form :model="issueForm" label-position="top">
+                    <el-form-item label="Мероприятие">
+                      <el-select v-model="issueForm.event_id" class="w-full" @change="syncIssueEvent">
+                        <el-option v-for="event in events" :key="event.id" :label="event.title" :value="event.id" />
+                      </el-select>
+                    </el-form-item>
+                  </el-form>
+                  <div class="verify-grid">
+                    <div class="verify-item">
+                      <span>Участников выбрано</span>
+                      <strong>{{ participants.length }}</strong>
+                    </div>
+                    <div class="verify-item">
+                      <span>Импорт</span>
+                      <strong>{{ importPreview ? 'Проверен' : 'Не выбран' }}</strong>
+                    </div>
+                  </div>
+                  <input class="file-input top-gap" type="file" accept=".csv,.xlsx" @change="handleIssueImportFileChange" />
+                  <div v-if="importPreview" class="helper-text">
+                    Валидных строк: {{ importPreview.rows_valid }}, ошибок: {{ importPreview.rows_failed }}
+                  </div>
+                </div>
+
+                <div v-else-if="issueStep === 1">
+                  <el-form :model="issueForm" label-position="top">
+                    <el-form-item label="Шаблон">
+                      <el-select v-model="issueForm.template_id" class="w-full">
+                        <el-option v-for="template in templates" :key="template.id" :label="template.name" :value="template.id" />
+                      </el-select>
+                    </el-form-item>
+                    <el-form-item label="Подписант">
+                      <el-input v-model="issueForm.signatory_name" />
+                    </el-form-item>
+                    <el-form-item label="Должность">
+                      <el-input v-model="issueForm.signatory_position" />
+                    </el-form-item>
+                    <el-form-item label="Рассылка">
+                      <el-switch v-model="issueForm.send_email" active-text="Отправить по email" />
+                    </el-form-item>
+                  </el-form>
+                </div>
+
+                <div v-else-if="issueStep === 2">
+                  <el-button type="primary" @click="loadIssuePreview">Сформировать предпросмотр</el-button>
+                  <div v-if="issuePreview" class="document-preview">
+                    <p class="document-card__number">{{ issuePreview.number }}</p>
+                    <h3>{{ issuePreview.template_name }}</h3>
+                    <p>{{ issuePreview.full_name }}</p>
+                    <p>{{ issuePreview.event_title }}</p>
+                    <p class="helper-text">{{ issuePreview.signature_status }}</p>
+                  </div>
+                </div>
+
+                <div v-else>
+                  <el-result
+                    icon="success"
+                    title="Готово к выпуску"
+                    :sub-title="`Мероприятие: ${selectedIssueEvent?.title || '-'}, шаблон: ${selectedIssueTemplate?.name || '-'}`"
+                  />
+                </div>
+
+                <div class="document-actions">
+                  <el-button :disabled="issueStep === 0" @click="issueStep -= 1">Назад</el-button>
+                  <el-button v-if="issueStep < 3" type="primary" @click="nextIssueStep">Далее</el-button>
+                  <el-button v-else type="primary" @click="issueDocuments">Выпустить пакет</el-button>
+                </div>
+              </div>
             </el-card>
 
             <el-card>
@@ -272,6 +472,7 @@
                     <p class="recipient-doc-card__status">{{ doc.signature_status }}</p>
                     <p class="recipient-doc-card__date">Выдан: {{ formatDocumentDate(doc.issued_at) }}</p>
                     <el-link :href="doc.qr_link" target="_blank" type="primary">Открыть проверку</el-link>
+                    <el-link :href="normalizeFileUrl(doc.pdf_url)" target="_blank" type="primary">Скачать PDF</el-link>
                   </article>
                 </div>
                 <div class="recipient-pagination">
@@ -366,6 +567,17 @@ const adminUsers = ref([])
 const adminRoles = ref([])
 const roleDrafts = ref({})
 const roleUpdateLoadingByUser = reactive({})
+const importPreview = ref(null)
+const issuePreview = ref(null)
+const issueStep = ref(0)
+const selectedTemplateId = ref(null)
+const selectedElementId = ref(null)
+const newElementField = ref('full_name')
+const dragState = ref(null)
+const designer = reactive({
+  orientation: 'landscape',
+  elements: [],
+})
 const participantAssignForm = reactive({
   status: 'Подтвержден',
   achievement: '',
@@ -404,6 +616,51 @@ const templateForm = reactive({
   allowed_fields: [...templateFields],
 })
 
+const defaultDesignerElements = () => [
+  {
+    id: `el-${Date.now()}-title`,
+    type: 'text',
+    field: 'document_title',
+    label: 'Сертификат',
+    x: 12,
+    y: 24,
+    w: 76,
+    h: 10,
+    fontSize: 34,
+    align: 'center',
+    wrap: true,
+    z: 1,
+  },
+  {
+    id: `el-${Date.now()}-name`,
+    type: 'variable',
+    field: 'full_name',
+    label: '{{ full_name }}',
+    x: 14,
+    y: 42,
+    w: 72,
+    h: 9,
+    fontSize: 28,
+    align: 'center',
+    wrap: true,
+    z: 2,
+  },
+  {
+    id: `el-${Date.now()}-qr`,
+    type: 'qr',
+    field: 'qr_link',
+    label: 'QR',
+    x: 82,
+    y: 72,
+    w: 11,
+    h: 16,
+    fontSize: 14,
+    align: 'center',
+    wrap: false,
+    z: 3,
+  },
+]
+
 const issueForm = reactive({
   event_id: null,
   template_id: null,
@@ -434,11 +691,23 @@ const paginatedRecipientDocuments = computed(() => {
   const startIndex = (recipientPage.value - 1) * recipientPageSize
   return recipientDocuments.value.slice(startIndex, startIndex + recipientPageSize)
 })
+const selectedTemplate = computed(() => templates.value.find((template) => template.id === selectedTemplateId.value))
+const selectedElement = computed(() => designer.elements.find((element) => element.id === selectedElementId.value))
+const sortedDesignerElements = computed(() => [...designer.elements].sort((a, b) => (a.z || 0) - (b.z || 0)))
+const selectedIssueEvent = computed(() => events.value.find((event) => event.id === issueForm.event_id))
+const selectedIssueTemplate = computed(() => templates.value.find((template) => template.id === issueForm.template_id))
 
 const getErrorMessage = (error, fallback) => error?.response?.data?.detail || fallback
 const withFallbackData = (data, fallback) => {
   if (!Array.isArray(data)) return fallback
   return data.length ? data : fallback
+}
+const normalizeFileUrl = (value) => {
+  if (!value) return ''
+  if (/^https?:\/\//i.test(value)) return value
+  const base = (api.defaults.baseURL || '').replace(/\/$/, '')
+  const path = String(value).startsWith('/') ? value : `/${value}`
+  return `${base}${path}`
 }
 
 const loadDashboard = async () => {
@@ -494,6 +763,9 @@ const loadDashboard = async () => {
     }
     if (!issueForm.template_id && templates.value.length) {
       issueForm.template_id = templates.value[0].id
+    }
+    if (!selectedTemplateId.value && templates.value.length) {
+      selectTemplate(templates.value[0])
     }
   } catch (error) {
     templates.value = [...mockTemplates]
@@ -586,6 +858,83 @@ const addRegisteredUsersToEvent = async () => {
   }
 }
 
+const handleImportFileChange = async (event) => {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!file) return
+  if (!selectedEventId.value) {
+    ElMessage.warning('Сначала выберите мероприятие')
+    return
+  }
+
+  const payload = new FormData()
+  payload.append('file', file)
+  try {
+    const { data } = await api.post(`/events/${selectedEventId.value}/participants/import/preview`, payload, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    importPreview.value = data
+    ElMessage.success(`Файл проверен: валидных строк ${data.rows_valid}`)
+  } catch (error) {
+    importPreview.value = null
+    ElMessage.error(getErrorMessage(error, 'Не удалось разобрать файл импорта'))
+  }
+}
+
+const commitParticipantImport = async () => {
+  if (!selectedEventId.value || !importPreview.value?.batch_id) return
+  try {
+    const { data } = await api.post(`/events/${selectedEventId.value}/participants/import/${importPreview.value.batch_id}/commit`)
+    ElMessage.success(`Импортировано участников: ${data.imported}`)
+    importPreview.value = null
+    await loadDashboard()
+    await loadParticipants()
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, 'Не удалось завершить импорт'))
+  }
+}
+
+const syncIssueEvent = async () => {
+  if (issueForm.event_id) {
+    selectedEventId.value = issueForm.event_id
+    await loadParticipants()
+  }
+}
+
+const handleIssueImportFileChange = async (event) => {
+  if (issueForm.event_id) {
+    selectedEventId.value = issueForm.event_id
+  }
+  await handleImportFileChange(event)
+}
+
+const nextIssueStep = async () => {
+  if (issueStep.value === 0) {
+    if (!issueForm.event_id) {
+      ElMessage.warning('Выберите мероприятие')
+      return
+    }
+    if (importPreview.value?.batch_id) {
+      await commitParticipantImport()
+    } else {
+      await syncIssueEvent()
+    }
+    if (!participants.value.length) {
+      ElMessage.warning('Для выпуска нужны участники')
+      return
+    }
+  }
+  if (issueStep.value === 1 && !issueForm.template_id) {
+    ElMessage.warning('Выберите шаблон')
+    return
+  }
+  if (issueStep.value === 2 && !issuePreview.value) {
+    await loadIssuePreview()
+    if (!issuePreview.value) return
+  }
+  issueStep.value += 1
+}
+
 
 
 const updateUserRole = async (user) => {
@@ -618,23 +967,198 @@ const updateUserRole = async (user) => {
 
 const createTemplate = async () => {
   try {
-    await api.post('/templates', templateForm)
+    const { data } = await api.post('/templates', {
+      ...templateForm,
+      layout_config: buildDesignerLayout(),
+    })
     ElMessage.success('Шаблон сохранен')
     await loadDashboard()
+    selectTemplate(data)
   } catch (error) {
     ElMessage.error(getErrorMessage(error, 'Не удалось создать шаблон'))
   }
+}
+
+const normalizeTemplateLayout = (template) => {
+  let layout = template?.layout_config || {}
+  if (typeof layout === 'string') {
+    try {
+      layout = JSON.parse(layout)
+    } catch {
+      layout = {}
+    }
+  }
+  designer.orientation = template?.orientation || layout.orientation || 'landscape'
+  designer.elements = Array.isArray(layout.elements) && layout.elements.length
+    ? layout.elements.map((element, index) => ({
+        id: element.id || `el-${Date.now()}-${index}`,
+        type: element.type || 'variable',
+        field: element.field || '',
+        label: element.label || element.field || 'Слой',
+        x: Number(element.x ?? 10),
+        y: Number(element.y ?? 10),
+        w: Number(element.w ?? 30),
+        h: Number(element.h ?? 8),
+        fontSize: Number(element.fontSize ?? 18),
+        align: element.align || 'left',
+        wrap: Boolean(element.wrap ?? true),
+        z: Number(element.z ?? index + 1),
+      }))
+    : defaultDesignerElements()
+  selectedElementId.value = designer.elements[0]?.id || null
+}
+
+const selectTemplate = (template) => {
+  if (!template) return
+  selectedTemplateId.value = template.id
+  templateForm.name = template.name
+  templateForm.orientation = template.orientation
+  templateForm.description = template.description || ''
+  templateForm.allowed_fields = Array.isArray(template.allowed_fields) ? template.allowed_fields : [...templateFields]
+  normalizeTemplateLayout(template)
+}
+
+const buildDesignerLayout = () => ({
+  orientation: designer.orientation,
+  elements: designer.elements,
+  fonts_locked: true,
+  colors_locked: true,
+  logos_locked: true,
+  grid_locked: true,
+  margins_locked: true,
+  page: 'A4',
+})
+
+const saveTemplateLayout = async () => {
+  if (!selectedTemplateId.value) {
+    ElMessage.warning('Выберите шаблон')
+    return
+  }
+  try {
+    const { data } = await api.patch(`/templates/${selectedTemplateId.value}/layout`, {
+      layout_config: buildDesignerLayout(),
+    })
+    ElMessage.success('Макет шаблона сохранен')
+    const index = templates.value.findIndex((template) => template.id === data.id)
+    if (index >= 0) {
+      templates.value[index] = data
+    }
+    selectTemplate(data)
+  } catch (error) {
+    ElMessage.error(getErrorMessage(error, 'Не удалось сохранить макет'))
+  }
+}
+
+const addDesignerElement = (type) => {
+  const z = designer.elements.length + 1
+  const field = type === 'variable' ? newElementField.value : type
+  const label = type === 'variable' ? `{{ ${field} }}` : type === 'qr' ? 'QR' : 'Подпись'
+  designer.elements.push({
+    id: `el-${Date.now()}-${z}`,
+    type,
+    field,
+    label,
+    x: type === 'qr' ? 80 : 16,
+    y: 16 + z * 6,
+    w: type === 'qr' ? 12 : 54,
+    h: type === 'qr' ? 16 : 8,
+    fontSize: type === 'qr' ? 14 : 18,
+    align: type === 'qr' ? 'center' : 'left',
+    wrap: type !== 'qr',
+    z,
+  })
+  selectedElementId.value = designer.elements.at(-1).id
+}
+
+const duplicateDesignerElement = () => {
+  if (!selectedElement.value) return
+  const copy = {
+    ...selectedElement.value,
+    id: `el-${Date.now()}-copy`,
+    label: `${selectedElement.value.label} копия`,
+    x: Math.min(96, selectedElement.value.x + 3),
+    y: Math.min(96, selectedElement.value.y + 3),
+    z: designer.elements.length + 1,
+  }
+  designer.elements.push(copy)
+  selectedElementId.value = copy.id
+}
+
+const removeDesignerElement = () => {
+  if (!selectedElementId.value) return
+  designer.elements = designer.elements.filter((element) => element.id !== selectedElementId.value)
+  selectedElementId.value = designer.elements[0]?.id || null
+}
+
+const designerElementStyle = (element) => ({
+  left: `${element.x}%`,
+  top: `${element.y}%`,
+  width: `${element.w}%`,
+  height: `${element.h}%`,
+  fontSize: `${element.fontSize}px`,
+  textAlign: element.align,
+  zIndex: element.z,
+  whiteSpace: element.wrap ? 'normal' : 'nowrap',
+})
+
+const startDesignerDrag = (event, element) => {
+  selectedElementId.value = element.id
+  dragState.value = {
+    id: element.id,
+    startX: event.clientX,
+    startY: event.clientY,
+    originX: element.x,
+    originY: element.y,
+  }
+}
+
+const moveDesignerElement = (event) => {
+  if (!dragState.value) return
+  const element = designer.elements.find((item) => item.id === dragState.value.id)
+  if (!element) return
+  const page = event.currentTarget.querySelector('.designer-page')
+  const rect = page.getBoundingClientRect()
+  const dx = ((event.clientX - dragState.value.startX) / rect.width) * 100
+  const dy = ((event.clientY - dragState.value.startY) / rect.height) * 100
+  element.x = Math.max(0, Math.min(100 - element.w, Number((dragState.value.originX + dx).toFixed(1))))
+  element.y = Math.max(0, Math.min(100 - element.h, Number((dragState.value.originY + dy).toFixed(1))))
+}
+
+const finishDesignerDrag = () => {
+  dragState.value = null
 }
 
 const issueDocuments = async () => {
   try {
     const { data } = await api.post('/documents/issue', issueForm)
     ElMessage.success(`Выпущено документов: ${data.issued}`)
+    issuePreview.value = null
+    issueStep.value = 4
     await loadDashboard()
     await loadParticipants()
     await loadAudit()
   } catch (error) {
     ElMessage.error(getErrorMessage(error, 'Не удалось выпустить документы'))
+  }
+}
+
+const loadIssuePreview = async () => {
+  if (!issueForm.event_id || !issueForm.template_id) {
+    ElMessage.warning('Выберите мероприятие и шаблон')
+    return
+  }
+  try {
+    issueStep.value = 2
+    const { data } = await api.get('/documents/preview', {
+      params: {
+        event_id: issueForm.event_id,
+        template_id: issueForm.template_id,
+      },
+    })
+    issuePreview.value = data
+  } catch (error) {
+    issuePreview.value = null
+    ElMessage.error(getErrorMessage(error, 'Не удалось сформировать предпросмотр'))
   }
 }
 

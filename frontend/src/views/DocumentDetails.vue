@@ -77,6 +77,7 @@ const normalizeFileUrl = (value) => {
 const pdfUrl = computed(() => normalizeFileUrl(document.value?.pdf_url))
 const archiveUrl = computed(() => normalizeFileUrl(document.value?.archive_url))
 const imageUrl = computed(() => normalizeFileUrl(document.value?.image_url))
+const qrImageUrl = computed(() => normalizeFileUrl(document.value?.qr_image_url))
 const verificationUrl = computed(() => document.value?.qr_link || '')
 
 const generateQrCode = () => {
@@ -84,8 +85,7 @@ const generateQrCode = () => {
     ElMessage.warning('Ссылка для проверки документа недоступна')
     return
   }
-  const encoded = encodeURIComponent(verificationUrl.value)
-  qrCodeUrl.value = `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encoded}`
+  qrCodeUrl.value = qrImageUrl.value
 }
 
 const downloadByLink = (url, fallbackName) => {
@@ -135,4 +135,3 @@ const openUser = () => {
 
 onMounted(loadDocument)
 </script>
-

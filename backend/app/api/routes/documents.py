@@ -1,18 +1,45 @@
 from datetime import datetime
+import json
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 
 from app.core.config import FRONTEND_URL
 from app.db import get_db_pool
-from app.deps import get_current_user, require_roles
-from app.schemas.documents import ConsentUpdate, IssueDocumentsRequest, TemplateCreate
+from app.deps import get_current_user, get_current_user_from_header_or_query, require_roles
+from app.schemas.documents import ConsentUpdate, IssueDocumentsRequest, TemplateCreate, TemplateLayoutUpdate
 from app.services.audit import add_audit_log
-from app.services.document_assets import ensure_document_assets
+from app.services.document_assets import DOCUMENTS_DIR, ensure_document_assets, render_document_assets
+from app.services.emailer import send_document_email
 
 
 router = APIRouter(tags=["documents"])
+
+
+def mask_for_reviewer(item: dict[str, Any], current_user: dict[str, Any]) -> dict[str, Any]:
+    if current_user["role"] == "reviewer":
+        item["email"] = ""
+        item["full_name"] = "Скрыто для роли проверяющего"
+        item["personal_link_token"] = None
+    return item
+
+
+async def build_document_context(connection, document_number: str) -> dict[str, Any] | None:
+    record = await connection.fetchrow(
+        """
+        SELECT d.*, p.full_name, p.email, p.status AS participant_status, p.award_category,
+               p.achievement, p.hours, e.title AS event_title, t.name AS template_name, t.layout_config
+        FROM documents d
+        JOIN participants p ON p.id = d.participant_id
+        JOIN events e ON e.id = d.event_id
+        JOIN templates t ON t.id = d.template_id
+        WHERE d.number = $1
+        """,
+        document_number,
+    )
+    return dict(record) if record else None
 
 
 @router.get("/templates")
@@ -51,16 +78,22 @@ async def create_template(
             payload.name,
             payload.orientation,
             payload.description,
-            payload.allowed_fields,
+            json.dumps(payload.allowed_fields, ensure_ascii=False),
             current_user["brand_name"],
             current_user["id"],
-            {
-                "fonts_locked": True,
-                "colors_locked": True,
-                "logos_locked": True,
-                "grid_locked": True,
-                "page": "A4",
-            },
+            json.dumps(
+                payload.layout_config
+                or {
+                    "fonts_locked": True,
+                    "colors_locked": True,
+                    "logos_locked": True,
+                    "grid_locked": True,
+                    "margins_locked": True,
+                    "page": "A4",
+                    "elements": [],
+                },
+                ensure_ascii=False,
+            ),
         )
         await add_audit_log(
             connection,
@@ -74,7 +107,9 @@ async def create_template(
 
 
 @router.get("/documents")
-async def get_documents() -> list[dict[str, Any]]:
+async def get_documents(
+    current_user: dict[str, Any] = Depends(require_roles("superadmin", "division_admin", "reviewer", "auditor")),
+) -> list[dict[str, Any]]:
     pool = get_db_pool()
     async with pool.acquire() as connection:
         records = await connection.fetch(
@@ -88,13 +123,13 @@ async def get_documents() -> list[dict[str, Any]]:
             ORDER BY d.id DESC
             """
         )
-
-    return [dict(record) for record in records]
+    return [mask_for_reviewer(dict(record), current_user) for record in records]
 
 
 @router.get("/documents/id/{document_id}")
 async def get_document_by_id(
     document_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     pool = get_db_pool()
     async with pool.acquire() as connection:
@@ -110,10 +145,9 @@ async def get_document_by_id(
             """,
             document_id,
         )
-        if not record:
-            raise HTTPException(status_code=404, detail="Документ не найден")
-
-    item = dict(record)
+    if not record:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    item = mask_for_reviewer(dict(record), current_user)
     ensure_document_assets(item["number"])
     return item
 
@@ -121,6 +155,7 @@ async def get_document_by_id(
 @router.get("/templates/{template_id}")
 async def get_template_by_id(
     template_id: int,
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     pool = get_db_pool()
     async with pool.acquire() as connection:
@@ -135,9 +170,86 @@ async def get_template_by_id(
             """,
             template_id,
         )
+    if not record:
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
+    return dict(record)
+
+
+@router.patch("/templates/{template_id}/layout")
+async def update_template_layout(
+    template_id: int,
+    payload: TemplateLayoutUpdate,
+    current_user: dict[str, Any] = Depends(require_roles("superadmin", "division_admin")),
+) -> dict[str, Any]:
+    layout = {
+        **payload.layout_config,
+        "fonts_locked": True,
+        "colors_locked": True,
+        "logos_locked": True,
+        "grid_locked": True,
+        "margins_locked": True,
+        "page": "A4",
+    }
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        record = await connection.fetchrow(
+            """
+            UPDATE templates
+            SET layout_config = $1::jsonb
+            WHERE id = $2
+            RETURNING *
+            """,
+            json.dumps(layout, ensure_ascii=False),
+            template_id,
+        )
         if not record:
             raise HTTPException(status_code=404, detail="Шаблон не найден")
-        return dict(record)
+        await add_audit_log(
+            connection,
+            actor=current_user,
+            action="template.layout_updated",
+            entity_type="template",
+            entity_id=template_id,
+            details={"elements": len(layout.get("elements", []))},
+        )
+    return dict(record)
+
+
+@router.get("/documents/preview")
+async def preview_document(
+    event_id: int,
+    template_id: int,
+    current_user: dict[str, Any] = Depends(require_roles("superadmin", "division_admin")),
+) -> dict[str, Any]:
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        record = await connection.fetchrow(
+            """
+            SELECT p.full_name, p.email, p.status AS participant_status, p.award_category, p.achievement, p.hours,
+                   e.title AS event_title, t.name AS template_name
+            FROM participants p
+            JOIN events e ON e.id = p.event_id
+            JOIN templates t ON t.id = $2
+            WHERE p.event_id = $1
+            ORDER BY p.id ASC
+            LIMIT 1
+            """,
+            event_id,
+            template_id,
+        )
+    if not record:
+        raise HTTPException(status_code=404, detail="Нет данных для предпросмотра")
+    item = dict(record)
+    item.update(
+        {
+            "number": f"PREVIEW-{datetime.now().year}",
+            "qr_link": f"{FRONTEND_URL}/verify/preview",
+            "signature_status": "Предпросмотр подписи",
+            "signatory_name": current_user["full_name"],
+            "signatory_position": current_user["division_name"],
+        }
+    )
+    return item
 
 
 @router.post("/documents/issue", status_code=201)
@@ -150,19 +262,15 @@ async def issue_documents(
         event_record = await connection.fetchrow("SELECT id, title FROM events WHERE id = $1", payload.event_id)
         if not event_record:
             raise HTTPException(status_code=404, detail="Мероприятие не найдено")
-
         template_record = await connection.fetchrow("SELECT id, name FROM templates WHERE id = $1", payload.template_id)
         if not template_record:
             raise HTTPException(status_code=404, detail="Шаблон не найден")
-
-        participants = await connection.fetch(
-            "SELECT * FROM participants WHERE event_id = $1 ORDER BY id",
-            payload.event_id,
-        )
+        participants = await connection.fetch("SELECT * FROM participants WHERE event_id = $1 ORDER BY id", payload.event_id)
         if not participants:
             raise HTTPException(status_code=400, detail="Для мероприятия нет участников")
 
         issued_count = 0
+        email_statuses: dict[str, int] = {}
         for participant in participants:
             existing = await connection.fetchval(
                 "SELECT id FROM documents WHERE event_id = $1 AND participant_id = $2",
@@ -174,18 +282,19 @@ async def issue_documents(
 
             verification_code = uuid4().hex[:12]
             document_number = f"TOGU-{datetime.now().year}-{participant['id']:05d}"
-            await connection.execute(
+            document_id = await connection.fetchval(
                 """
                 INSERT INTO documents (
                     event_id, participant_id, template_id, number, verification_code, qr_link,
-                    pdf_url, archive_url, image_url, signature_status, signature_type,
+                    pdf_url, archive_url, image_url, qr_image_url, signature_status, signature_type,
                     signatory_name, signatory_position, issued_by, issued_at, status, email_sent_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6,
-                    $7, $8, $9, $10, $11,
-                    $12, $13, $14, CURRENT_TIMESTAMP, $15, $16
+                    $7, $8, $9, $10, $11, $12,
+                    $13, $14, $15, CURRENT_TIMESTAMP, $16, $17
                 )
+                RETURNING id
                 """,
                 payload.event_id,
                 participant["id"],
@@ -193,9 +302,10 @@ async def issue_documents(
                 document_number,
                 verification_code,
                 f"{FRONTEND_URL}/verify/{verification_code}",
-                f"/documents/{document_number}.pdf",
-                f"/documents/{document_number}.pdfa",
-                f"/documents/{document_number}.png",
+                f"/documents/files/{document_number}/pdf",
+                f"/documents/files/{document_number}/pdfa",
+                f"/documents/files/{document_number}/png",
+                f"/documents/files/{document_number}/qr",
                 "Подписан УКЭП" if payload.signature_type == "УКЭП" else "Подписан",
                 payload.signature_type,
                 payload.signatory_name,
@@ -204,7 +314,12 @@ async def issue_documents(
                 "delivered" if payload.send_email else "issued",
                 datetime.now() if payload.send_email else None,
             )
-            ensure_document_assets(document_number)
+            context = await build_document_context(connection, document_number)
+            if context:
+                render_document_assets(context)
+                if payload.send_email:
+                    status = await send_document_email(connection, {**context, "id": document_id})
+                    email_statuses[status] = email_statuses.get(status, 0) + 1
             issued_count += 1
 
         await connection.execute("UPDATE events SET status = 'completed' WHERE id = $1", payload.event_id)
@@ -216,7 +331,12 @@ async def issue_documents(
             entity_id=payload.event_id,
             details={"count": issued_count, "template_id": payload.template_id, "send_email": payload.send_email},
         )
-        return {"issued": issued_count, "event_title": event_record["title"], "template_name": template_record["name"]}
+        return {
+            "issued": issued_count,
+            "event_title": event_record["title"],
+            "template_name": template_record["name"],
+            "email_statuses": email_statuses,
+        }
 
 
 @router.get("/documents/{verification_code}/verify")
@@ -238,9 +358,9 @@ async def verify_document(verification_code: str) -> dict[str, Any]:
             """,
             verification_code,
         )
-        if not record:
-            raise HTTPException(status_code=404, detail="Документ не найден")
-        return dict(record)
+    if not record:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    return dict(record)
 
 
 @router.get("/recipient/documents")
@@ -249,7 +369,7 @@ async def recipient_documents(current_user: dict[str, Any] = Depends(get_current
     async with pool.acquire() as connection:
         records = await connection.fetch(
             """
-            SELECT d.id, d.number, d.status, d.qr_link, d.pdf_url, d.archive_url, d.image_url,
+            SELECT d.id, d.number, d.status, d.qr_link, d.pdf_url, d.archive_url, d.image_url, d.qr_image_url,
                    d.signature_status, d.signature_type, d.signatory_name, d.signatory_position,
                    d.issued_at, d.email_sent_at,
                    p.personal_link_token, p.status AS participant_status, p.award_category, p.hours,
@@ -271,7 +391,7 @@ async def recipient_link_documents(token: str) -> dict[str, Any]:
     async with pool.acquire() as connection:
         records = await connection.fetch(
             """
-            SELECT d.id, d.number, d.status, d.qr_link, d.pdf_url, d.archive_url, d.image_url,
+            SELECT d.id, d.number, d.status, d.qr_link, d.pdf_url, d.archive_url, d.image_url, d.qr_image_url,
                    d.signature_status, d.signature_type, d.signatory_name, d.signatory_position,
                    d.issued_at, d.email_sent_at,
                    p.full_name, p.email, p.status AS participant_status, p.award_category, p.hours,
@@ -284,9 +404,37 @@ async def recipient_link_documents(token: str) -> dict[str, Any]:
             """,
             token,
         )
-        if not records:
-            raise HTTPException(status_code=404, detail="Персональная ссылка не найдена")
-        return {"documents": [dict(record) for record in records]}
+    if not records:
+        raise HTTPException(status_code=404, detail="Персональная ссылка не найдена")
+    return {"documents": [dict(record) for record in records]}
+
+
+@router.get("/recipient/link/{token}/files/{document_number}/{kind}")
+async def get_recipient_link_file(token: str, document_number: str, kind: str) -> FileResponse:
+    if kind not in {"pdf", "pdfa", "png", "qr"}:
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        record = await connection.fetchrow(
+            """
+            SELECT d.number
+            FROM participants p
+            JOIN documents d ON d.participant_id = p.id
+            WHERE p.personal_link_token = $1 AND d.number = $2
+            """,
+            token,
+            document_number,
+        )
+        context = await build_document_context(connection, document_number)
+    if not record:
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    if context:
+        ensure_document_assets(document_number, context)
+    suffix = {"pdf": ".pdf", "pdfa": ".pdfa", "png": ".png", "qr": "-qr.png"}[kind]
+    path = DOCUMENTS_DIR / f"{document_number}{suffix}"
+    media_type = "application/pdf" if kind in {"pdf", "pdfa"} else "image/png"
+    filename = f"{document_number}.{kind if kind != 'qr' else 'png'}"
+    return FileResponse(path, media_type=media_type, filename=filename)
 
 
 @router.put("/recipient/consent")
@@ -301,6 +449,15 @@ async def update_consent(
             payload.consent_to_processing,
             current_user["id"],
         )
+        await connection.execute(
+            """
+            INSERT INTO consent_history (user_id, consent_to_processing, changed_by, source)
+            VALUES ($1, $2, $3, 'account')
+            """,
+            current_user["id"],
+            payload.consent_to_processing,
+            current_user["id"],
+        )
         await add_audit_log(
             connection,
             actor=current_user,
@@ -310,3 +467,42 @@ async def update_consent(
             details={"consent_to_processing": payload.consent_to_processing},
         )
         return {"consent_to_processing": payload.consent_to_processing}
+
+
+@router.get("/documents/files/{document_number}/{kind}")
+async def get_document_file(
+    document_number: str,
+    kind: str,
+    current_user: dict[str, Any] = Depends(get_current_user_from_header_or_query),
+) -> FileResponse:
+    if kind not in {"pdf", "pdfa", "png", "qr"}:
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    pool = get_db_pool()
+    async with pool.acquire() as connection:
+        record = await connection.fetchrow(
+            """
+            SELECT d.number, p.email
+            FROM documents d
+            JOIN participants p ON p.id = d.participant_id
+            WHERE d.number = $1
+            """,
+            document_number,
+        )
+        context = await build_document_context(connection, document_number)
+    if not record:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    allowed_roles = {"superadmin", "division_admin", "auditor", "reviewer"}
+    if current_user["role"] not in allowed_roles and current_user["email"] != record["email"]:
+        raise HTTPException(status_code=403, detail="Нет доступа к файлу")
+
+    if context:
+        ensure_document_assets(document_number, context)
+    else:
+        ensure_document_assets(document_number)
+    suffix = {"pdf": ".pdf", "pdfa": ".pdfa", "png": ".png", "qr": "-qr.png"}[kind]
+    path = DOCUMENTS_DIR / f"{document_number}{suffix}"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    media_type = "application/pdf" if kind in {"pdf", "pdfa"} else "image/png"
+    filename = f"{document_number}.{kind if kind != 'qr' else 'png'}"
+    return FileResponse(path, media_type=media_type, filename=filename)

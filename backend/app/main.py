@@ -3,10 +3,9 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.api.router import api_router
-from app.core.config import DB_CONFIG
+from app.core.config import CORS_ORIGINS, DB_CONFIG
 from app.db import close_db, connect_db
 from app.services.bootstrap import create_schema, seed_initial_data
 from app.services.document_assets import ensure_documents_dir
@@ -19,20 +18,20 @@ app = FastAPI(title="TOGU Documents API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(api_router)
-app.mount("/documents", StaticFiles(directory=ensure_documents_dir()), name="documents")
 
 
 @app.on_event("startup")
 async def startup() -> None:
     logger.info("Подключение к БД %s:%s/%s", DB_CONFIG["host"], DB_CONFIG["port"], DB_CONFIG["database"])
     pool = await connect_db()
+    ensure_documents_dir()
     async with pool.acquire() as connection:
         await create_schema(connection)
     await seed_initial_data()
